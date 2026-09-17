@@ -11,7 +11,7 @@ enum LoggerMode : uint8_t {
   MODE_RECORD_WAV = 4,
 };
 
-constexpr LoggerMode LOGGER_MODE = MODE_RECORD_WAV;
+constexpr LoggerMode LOGGER_MODE = MODE_RECORD_RAW_PCM;
 constexpr char FIRMWARE_VERSION[] = "0.1.0";
 
 // Serial diagnostics
@@ -48,7 +48,7 @@ constexpr uint8_t MIC_TO_PCM_RIGHT_SHIFT = 16;
 // Test durations. A value of 0 means run until reset/power removal.
 constexpr uint32_t SD_WRITE_TEST_SECONDS = 30 * 60;
 constexpr uint32_t I2S_DISCARD_TEST_SECONDS = 15 * 60;
-constexpr uint32_t RECORD_TEST_SECONDS = 30;
+constexpr uint32_t RECORD_TEST_SECONDS = 0;
 
 // Long recordings are segmented so a reset risks only the active file.
 constexpr uint32_t FILE_SEGMENT_SECONDS = 30 * 60;
