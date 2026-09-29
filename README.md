@@ -2,9 +2,11 @@
 
 ESP32 + I2S microphone + SD card. Records continuous mono 16-bit 48kHz PCM audio to the SD card, rotating into a new file every 30 minutes. No Wi-Fi or Bluetooth involved.
 
+Supports two boards: the classic **ESP32 DOIT DevKit V1** and the **Seeed XIAO ESP32-C3**. Pin numbers differ between them — everything below is split out per board where it matters.
+
 ## Parts
 
-- ESP32 DOIT DevKit V1 (classic ESP32 dev board)
+- ESP32 DOIT DevKit V1 **or** Seeed XIAO ESP32-C3
 - INMP441 I2S microphone breakout
 - SPI microSD breakout (the kind with an onboard 3.3V regulator + logic-level shifter)
 - Breadboard + jumper wires
@@ -12,6 +14,8 @@ ESP32 + I2S microphone + SD card. Records continuous mono 16-bit 48kHz PCM audio
 - USB cable (powers everything, for now)
 
 ## Wire it up
+
+### DOIT ESP32 DEVKIT V1
 
 **SD breakout → ESP32**
 
@@ -35,15 +39,43 @@ ESP32 + I2S microphone + SD card. Records continuous mono 16-bit 48kHz PCM audio
 | `SD` | `GPIO33` |
 | `L/R` | `GND` |
 
-All grounds must be tied together. The mic must run on 3.3V, never 5V. Unplug USB before changing any wiring.
+### Seeed XIAO ESP32-C3
+
+**SD breakout → XIAO**
+
+| SD | XIAO pin | GPIO |
+| --- | --- | --- |
+| `VCC` | `5V` | — |
+| `GND` | `GND` | — |
+| `MOSI` | `D10` | GPIO10 |
+| `MISO` | `D9` | GPIO9 |
+| `SCK` | `D8` | GPIO8 |
+| `CS` | `D3` | GPIO5 |
+
+**INMP441 → XIAO**
+
+| INMP441 | XIAO pin | GPIO |
+| --- | --- | --- |
+| `VDD` | `3V3` | — |
+| `GND` | `GND` | — |
+| `SCK` | `D1` | GPIO3 |
+| `WS` | `D4` | GPIO6 |
+| `SD` | `D5` | GPIO7 |
+| `L/R` | `GND` | — |
+
+Note: GPIO8/GPIO9 (`D8`/`D9`) are boot-strapping pins on the C3. Using them for SD `SCK`/`MISO` is the board's documented standard wiring and normally fine, but if the board ever fails to boot or flash after wiring the SD card, disconnect the SD card and retry — that pinpoints whether the card is interfering with boot strapping.
+
+Both boards: all grounds must be tied together, and the mic must run on 3.3V, never 5V. Unplug USB before changing any wiring.
 
 ## Flash it
 
 1. In Arduino IDE, install board package **esp32 by Espressif Systems**, version **3.3.11** (Boards Manager).
-2. **Tools > Board > esp32 > DOIT ESP32 DEVKIT V1**.
+2. **Tools > Board > esp32 >** select **DOIT ESP32 DEVKIT V1** or **XIAO_ESP32C3**, matching your board.
 3. **Tools > Port** — select your board.
 4. Open `continuous_audio_logger.ino`. Confirm `config.h` appears as its own tab in the same window — it has to be in the same folder as the `.ino` or the sketch won't compile.
 5. Click **Upload**.
+
+`config.h` picks the right pin numbers automatically based on which board you selected in step 2 — no manual edits needed. Selecting a third board that isn't listed above will fail to compile with a clear error instead of silently using the wrong pins.
 
 ## Check that it's recording
 
@@ -56,9 +88,58 @@ That's the whole loop. It starts recording the moment it powers up and keeps goi
 
 ## If it doesn't work
 
-- **Wrong-looking board name during upload** — make sure `ESP32-C3` isn't selected instead of the DOIT DevKit V1.
+- **Wrong board selected** — make sure **Tools > Board** actually matches your physical board (DOIT DevKit V1 vs XIAO_ESP32C3). The wrong selection compiles fine but wires up the wrong GPIOs.
 - **`SD.begin() failed` in Serial Monitor** — check the SD wiring for loose contacts, and try a different USB cable/port. A card's power-up spike can brown out the board on a weak USB connection.
 - **Compiler says it can't find `setup()`** — `config.h` isn't sitting next to the `.ino` in the same folder.
+
+## Power
+
+`CPU_POWER_PROFILE` in `config.h` picks the CPU clock, resolved per board. Only frequencies the chip actually accepts are listed — both boards run a 40 MHz crystal and support crystal/1 and crystal/2, but only the classic ESP32 also supports crystal/4, so the C3 bottoms out at 20 MHz:
+
+| Profile | Classic ESP32 | XIAO ESP32-C3 |
+| --- | --- | --- |
+| `POWER_SUPER_LOW` | 10 MHz | 20 MHz |
+| `POWER_LOW` | 40 MHz | 40 MHz |
+| `POWER_NORMAL` (default) | 80 MHz | 80 MHz |
+| `POWER_FULL` | 240 MHz | 160 MHz |
+
+What lowering the CPU clock does and does not affect:
+
+- **I2S sample rate is not affected.** On both chips I2S is clocked from the 160 MHz PLL, not from the CPU/APB clock, so 48 kHz stays exact at any profile.
+- **The SD SPI clock is affected.** SPI is clocked from APB, and APB follows the CPU clock once the CPU drops below 80 MHz (true on *both* chips). The firmware clamps the requested SPI clock to fit and reports it at startup. This costs bandwidth the recording does not need — audio is only 96 kB/s, so even a heavily clamped clock has a large margin.
+- **The real cost is CPU time**, not clocks: the FAT/SD stack still has to keep up in real time. Below `POWER_NORMAL` that margin shrinks. If you use a lower profile, run it for a while and confirm `dropped`, `sd-retry` and `sd-recover` all stay at zero.
+
+Other firmware-side power settings: set `SERIAL_DIAGNOSTICS = false` for a deployed logger (stops the recurring metrics line), and note that larger `AUDIO_SAMPLES_PER_BLOCK` means fewer SD write transactions and less card active time.
+
+### Where the watts actually go
+
+A measured **0.35 W (about 70 mA at 5 V)** for the classic DevKit V1 + SD breakout + mic on a breadboard is normal, and most of it is *not* the ESP32:
+
+| Source | Rough draw | Firmware can fix it? |
+| --- | --- | --- |
+| Power LEDs (one on the DevKit, usually one on the SD breakout) | 10–20 mA | No — desolder them |
+| USB-serial chip (CP2102/CH340) on the DevKit | 10–20 mA | No |
+| Two AMS1117 LDOs (quiescent + burning 34% of everything as heat at 5→3.3 V) | ~10 mA + losses | No |
+| ESP32 core at 80 MHz, radios off | ~25–30 mA | Yes — `CPU_POWER_PROFILE` |
+| SD card (bursty, while writing) | ~10–20 mA avg | Partly — larger writes |
+
+So firmware alone gets this board to roughly 0.20–0.22 W at best. To go meaningfully below that:
+
+1. **Use the XIAO ESP32-C3 instead.** It has no separate USB-serial chip, a more efficient regulator, and a lower-power core. This is the single biggest lever and you already have one.
+2. **Remove the power LEDs** on both the dev board and the SD breakout.
+3. **Feed 3.3 V directly** (bypassing the onboard LDO and USB-serial chip) from an efficient buck converter rather than 5 V USB.
+4. In Arduino IDE, **Tools > Flash Frequency > 40 MHz** trims a little more.
+
+Deeper tricks are not available here: automatic light sleep is fundamentally incompatible with continuous I2S capture (the DMA stops), and dynamic frequency scaling (`esp_pm_configure`) is compiled out of the stock Arduino ESP32 libraries — `CONFIG_PM_ENABLE` is not set for either chip, so using it would mean leaving the Arduino IDE for a custom ESP-IDF build. Wi-Fi and Bluetooth are never initialized.
+
+## Reliability
+
+Storage faults no longer end a recording. A short or failed SD write is retried (`SD_WRITE_RETRY_LIMIT`), then escalates to reopening the file, then to remounting the card (`SD_RECOVERY_LIMIT`), and only stops if recovery itself keeps failing. A genuinely full card stops cleanly with a clear message instead of retrying forever. Retries and recoveries are counted in the metrics line as `sd-retry` and `sd-recover` — both should stay at zero on healthy hardware.
+
+Still true, and worth knowing before an unattended deployment:
+
+- **No timestamps.** Files are numbered, not dated; there is no RTC and no network time. You cannot tell what time a given recording happened.
+- **Dropped audio is silent.** If the card stalls longer than the buffer reserve (~680 ms), samples are dropped and the recording jump-cuts with no marker in the file. The `dropped` counter is the only evidence, and it is not written to the card.
 
 ## Other modes
 

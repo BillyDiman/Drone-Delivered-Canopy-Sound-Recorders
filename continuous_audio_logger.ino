@@ -22,6 +22,8 @@ struct Metrics {
   uint32_t i2sShortReads = 0;
   uint32_t sdShortWrites = 0;
   uint32_t sdWriteFailures = 0;
+  uint32_t sdWriteRetries = 0;
+  uint32_t sdRecoveries = 0;
   uint32_t maxSdWriteUs = 0;
   uint32_t queueHighWater = 0;
   int32_t rawMinimum = INT32_MAX;
@@ -124,10 +126,16 @@ void printBoardIdentity() {
   Serial.printf("Mode: %s\n", modeName());
   Serial.printf("Chip: %s, revision %u, cores %u\n",
                 ESP.getChipModel(), ESP.getChipRevision(), ESP.getChipCores());
-  Serial.printf("CPU: %u MHz, flash: %u bytes\n",
-                ESP.getCpuFreqMHz(), ESP.getFlashChipSize());
+  Serial.printf("CPU: %u MHz (APB %" PRIu32 " Hz), flash: %u bytes\n",
+                ESP.getCpuFreqMHz(), getApbFrequency(), ESP.getFlashChipSize());
   Serial.printf("Stored format: %u Hz, %u-bit, mono (%u bytes/s)\n",
                 SAMPLE_RATE_HZ, STORED_BITS_PER_SAMPLE, STORED_BYTE_RATE);
+  Serial.printf("Buffers: %u blocks x %u samples = %lu ms of reserve\n",
+                static_cast<unsigned>(AUDIO_BLOCK_COUNT),
+                static_cast<unsigned>(AUDIO_SAMPLES_PER_BLOCK),
+                static_cast<unsigned long>((AUDIO_BLOCK_COUNT *
+                                            AUDIO_SAMPLES_PER_BLOCK * 1000ULL) /
+                                           SAMPLE_RATE_HZ));
   Serial.println("Wi-Fi and Bluetooth are not initialized by this firmware.");
 }
 
@@ -146,16 +154,32 @@ const char *cardTypeName(uint8_t type) {
   }
 }
 
+// SPI is clocked from APB, and APB follows the CPU clock below 80 MHz, so
+// the configured rate is not always achievable. Audio needs 96 kB/s, so a
+// clamped clock still has plenty of bandwidth; this just keeps the request
+// honest instead of silently landing somewhere unintended.
+uint32_t effectiveSdSpiHz() {
+  const uint32_t apb = getApbFrequency();
+  const uint32_t ceiling = apb / 2;
+  return SD_SPI_FREQUENCY_HZ > ceiling ? ceiling : SD_SPI_FREQUENCY_HZ;
+}
+
 bool initializeSd() {
   pinMode(SD_PIN_CS, OUTPUT);
   digitalWrite(SD_PIN_CS, HIGH);
   sdSpi.begin(SD_PIN_SCK, SD_PIN_MISO, SD_PIN_MOSI, SD_PIN_CS);
 
-  Serial.printf("Initializing SD: SCK=%d MISO=%d MOSI=%d CS=%d at %u Hz\n",
-                SD_PIN_SCK, SD_PIN_MISO, SD_PIN_MOSI, SD_PIN_CS,
-                SD_SPI_FREQUENCY_HZ);
+  const uint32_t spiHz = effectiveSdSpiHz();
+  Serial.printf("Initializing SD: SCK=%d MISO=%d MOSI=%d CS=%d at %" PRIu32
+                " Hz (APB %" PRIu32 " Hz)\n",
+                SD_PIN_SCK, SD_PIN_MISO, SD_PIN_MOSI, SD_PIN_CS, spiHz,
+                getApbFrequency());
+  if (spiHz != SD_SPI_FREQUENCY_HZ) {
+    Serial.printf("Note: SD SPI clamped from %" PRIu32 " Hz to fit APB.\n",
+                  SD_SPI_FREQUENCY_HZ);
+  }
 
-  if (!SD.begin(SD_PIN_CS, sdSpi, SD_SPI_FREQUENCY_HZ)) {
+  if (!SD.begin(SD_PIN_CS, sdSpi, spiHz)) {
     Serial.println("SD.begin() failed.");
     return false;
   }
@@ -173,11 +197,19 @@ bool initializeSd() {
   return true;
 }
 
+// Resumes scanning where the last successful search finished. Restarting
+// from 1 on every segment rotation made each rotation slower as recordings
+// accumulated, and that stall competes with real-time audio writes.
+uint32_t nextPathIndex = 1;
+
 bool findUnusedPath(const char *prefix, const char *extension,
                     char *output, size_t outputSize) {
-  for (uint32_t index = 1; index <= 9999; ++index) {
+  for (uint32_t index = nextPathIndex; index <= 9999; ++index) {
     snprintf(output, outputSize, "/%s%04" PRIu32 "%s", prefix, index, extension);
-    if (!SD.exists(output)) return true;
+    if (!SD.exists(output)) {
+      nextPathIndex = index + 1;
+      return true;
+    }
   }
   return false;
 }
@@ -211,16 +243,18 @@ void buildWavHeader(uint8_t *header, uint32_t payloadBytes) {
   putLe32(header + 40, payloadBytes);
 }
 
+// Reports failure without declaring a fatal error, so the writer can retry
+// this as part of recovering from a transient card problem.
 bool openNextRecordingFile() {
   const bool wav = LOGGER_MODE == MODE_RECORD_WAV;
   if (!findUnusedPath("REC", wav ? ".WAV" : ".PCM", activePath, sizeof(activePath))) {
-    stopWithError("No unused recording filename remains");
+    Serial.println("No unused recording filename remains.");
     return false;
   }
 
   activeFile = SD.open(activePath, FILE_WRITE);
   if (!activeFile) {
-    stopWithError("Could not create recording file");
+    Serial.printf("Could not create %s\n", activePath);
     return false;
   }
 
@@ -232,7 +266,7 @@ bool openNextRecordingFile() {
     buildWavHeader(header, 0);
     if (activeFile.write(header, sizeof(header)) != sizeof(header)) {
       activeFile.close();
-      stopWithError("Could not write WAV placeholder header");
+      Serial.println("Could not write WAV placeholder header.");
       return false;
     }
   }
@@ -244,16 +278,19 @@ bool openNextRecordingFile() {
 bool closeRecordingFile() {
   if (!activeFile) return true;
 
+  // Header problems leave the audio data intact and are not worth ending a
+  // recording over, so they are reported and handed back to the caller to
+  // recover from rather than treated as fatal.
   if (LOGGER_MODE == MODE_RECORD_WAV) {
     if (currentSegmentPayloadBytes > UINT32_MAX - 36) {
-      stopWithError("WAV segment exceeded the 32-bit RIFF size limit");
+      Serial.println("WAV segment exceeded the 32-bit RIFF size limit.");
       activeFile.close();
       return false;
     }
     uint8_t header[44];
     buildWavHeader(header, static_cast<uint32_t>(currentSegmentPayloadBytes));
     if (!activeFile.seek(0) || activeFile.write(header, sizeof(header)) != sizeof(header)) {
-      stopWithError("Could not finalize WAV header");
+      Serial.println("Could not finalize WAV header.");
       activeFile.close();
       return false;
     }
@@ -320,6 +357,7 @@ size_t writeMeasured(File &file, const uint8_t *data, size_t bytes) {
 }
 
 void printMetrics(bool force = false) {
+  if (!SERIAL_DIAGNOSTICS) return;
   const uint64_t nowMs = millis();
   if (!force && nowMs - lastMetricsMs < METRICS_INTERVAL_MS) return;
   lastMetricsMs = nowMs;
@@ -333,7 +371,8 @@ void printMetrics(bool force = false) {
   Serial.printf(
       "t=%.1fs samples=%llu expected=%llu queued=%llu dropped=%llu "
       "written=%llu expected-bytes=%llu max-write=%uus queue-high=%u "
-      "raw=[%ld,%ld] zeros=%llu clips=%llu i2s-short=%u sd-short=%u\n",
+      "raw=[%ld,%ld] zeros=%llu clips=%llu i2s-short=%u sd-short=%u "
+      "sd-retry=%u sd-recover=%u\n",
       seconds,
       static_cast<unsigned long long>(snapshot.samplesCaptured),
       static_cast<unsigned long long>(expectedSamples),
@@ -348,7 +387,9 @@ void printMetrics(bool force = false) {
       static_cast<unsigned long long>(snapshot.zeroSamples),
       static_cast<unsigned long long>(snapshot.clippedSamples),
       snapshot.i2sShortReads,
-      snapshot.sdShortWrites);
+      snapshot.sdShortWrites,
+      snapshot.sdWriteRetries,
+      snapshot.sdRecoveries);
 }
 
 void fillStressBuffer(uint32_t sequence) {
@@ -493,7 +534,13 @@ void captureTask(void *parameter) {
     if (bytesRead != requested) ++metrics.i2sShortReads;
     portEXIT_CRITICAL(&metricsMux);
 
-    if (sampleCount == 0) continue;
+    // Yield rather than spinning. This task runs at the highest priority,
+    // so a mic that stops delivering would otherwise starve the writer and
+    // the Arduino task outright on a single-core chip.
+    if (sampleCount == 0) {
+      vTaskDelay(1);
+      continue;
+    }
 
     AudioBlock *block = nullptr;
     if (xQueueReceive(freeBlockQueue, &block, 0) != pdTRUE) {
@@ -532,28 +579,96 @@ void captureTask(void *parameter) {
   vTaskDelete(nullptr);
 }
 
+uint8_t consecutiveRecoveries = 0;
+
+bool storageExhausted() {
+  const uint64_t total = SD.totalBytes();
+  const uint64_t used = SD.usedBytes();
+  if (total <= used) return true;
+  return (total - used) < SD_MIN_FREE_BYTES;
+}
+
+// Escalating recovery from a failed or short write: reopen the file, then
+// remount the card. A transient card stall used to end the whole recording
+// session permanently; now only a card that stays broken does.
+bool recoverStorage() {
+  portENTER_CRITICAL(&metricsMux);
+  ++metrics.sdRecoveries;
+  portEXIT_CRITICAL(&metricsMux);
+
+  if (++consecutiveRecoveries > SD_RECOVERY_LIMIT) {
+    stopWithError("SD storage did not recover after repeated attempts");
+    return false;
+  }
+
+  Serial.printf("SD write trouble; recovery attempt %u of %u\n",
+                consecutiveRecoveries, SD_RECOVERY_LIMIT);
+
+  activeFile.close();
+  delay(SD_RECOVERY_DELAY_MS);
+
+  // A full card cannot be retried out of, so say so plainly rather than
+  // burning through recovery attempts. Only trust this while the card is
+  // still responding; an unresponsive card reports zero capacity, which
+  // would otherwise look identical to a full one.
+  if (SD.cardType() != CARD_NONE && storageExhausted()) {
+    stopWithError("SD card is full");
+    return false;
+  }
+
+  if (openNextRecordingFile()) return true;
+
+  Serial.println("Reopen failed; remounting the card.");
+  SD.end();
+  delay(SD_RECOVERY_DELAY_MS);
+  if (initializeSd() && openNextRecordingFile()) return true;
+
+  return false;
+}
+
+bool rotateSegment() {
+  if (closeRecordingFile() && openNextRecordingFile()) return true;
+  return recoverStorage();
+}
+
 bool writeRecordingPayload(const uint8_t *data, size_t bytes) {
   const uint64_t segmentLimit = FILE_SEGMENT_SECONDS == 0
                                     ? UINT64_MAX
                                     : static_cast<uint64_t>(FILE_SEGMENT_SECONDS) * STORED_BYTE_RATE;
   size_t offset = 0;
+  uint8_t attempt = 0;
 
   while (offset < bytes && !fatalError) {
     if (currentSegmentPayloadBytes >= segmentLimit) {
-      if (!closeRecordingFile() || !openNextRecordingFile()) return false;
+      if (!rotateSegment()) return false;
     }
 
     const uint64_t capacity = segmentLimit - currentSegmentPayloadBytes;
     const size_t remaining = bytes - offset;
     const size_t portion = capacity < remaining ? static_cast<size_t>(capacity) : remaining;
 
-    if (writeMeasured(activeFile, data + offset, portion) != portion) {
-      stopWithError("Recording write failed or was short");
-      return false;
+    // Advance by what actually landed, so a retry resends only the missing
+    // tail rather than duplicating audio that already reached the card.
+    const size_t written = writeMeasured(activeFile, data + offset, portion);
+    currentSegmentPayloadBytes += written;
+    offset += written;
+
+    if (written != portion) {
+      portENTER_CRITICAL(&metricsMux);
+      ++metrics.sdWriteRetries;
+      portEXIT_CRITICAL(&metricsMux);
+
+      if (++attempt > SD_WRITE_RETRY_LIMIT) {
+        if (!recoverStorage()) return false;
+        attempt = 0;
+      } else {
+        delay(SD_RETRY_DELAY_MS);
+      }
+      continue;
     }
 
-    currentSegmentPayloadBytes += portion;
-    offset += portion;
+    attempt = 0;
+    consecutiveRecoveries = 0;
 
     if (millis() - lastFlushMs >= FILE_FLUSH_INTERVAL_MS) {
       activeFile.flush();
@@ -598,19 +713,35 @@ bool startRecording() {
     xQueueSend(freeBlockQueue, &block, portMAX_DELAY);
   }
 
-  if (!openNextRecordingFile()) return false;
+  if (!openNextRecordingFile()) {
+    stopWithError("Could not open the first recording file");
+    return false;
+  }
 
   modeStartUs = esp_timer_get_time();
   captureDone = false;
   writerDone = false;
 
+  // On single-core targets (e.g. ESP32-C3) there is no core 1 to pin to;
+  // xTaskCreatePinnedToCore with an out-of-range core ID asserts/fails.
+  // Pin to separate cores only where a second core actually exists, so a
+  // slow SD write can't block I2S capture; otherwise let FreeRTOS
+  // time-slice both tasks on the one core.
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+  constexpr BaseType_t writerCore = 1;
+  constexpr BaseType_t captureCore = 0;
+#else
+  constexpr BaseType_t writerCore = tskNO_AFFINITY;
+  constexpr BaseType_t captureCore = tskNO_AFFINITY;
+#endif
+
   if (xTaskCreatePinnedToCore(writerTask, "sd_writer", 8192, nullptr, 2,
-                              &writerTaskHandle, 1) != pdPASS) {
+                              &writerTaskHandle, writerCore) != pdPASS) {
     stopWithError("Could not create SD writer task");
     return false;
   }
   if (xTaskCreatePinnedToCore(captureTask, "i2s_capture", 8192, nullptr, 3,
-                              &captureTaskHandle, 0) != pdPASS) {
+                              &captureTaskHandle, captureCore) != pdPASS) {
     stopWithError("Could not create I2S capture task");
     return false;
   }
@@ -626,7 +757,8 @@ void serviceRecording() {
     Metrics snapshot;
     copyMetrics(snapshot);
     if (!fatalError && snapshot.samplesDropped == 0 &&
-        snapshot.sdShortWrites == 0 && snapshot.i2sShortReads == 0) {
+        snapshot.sdShortWrites == 0 && snapshot.i2sShortReads == 0 &&
+        snapshot.sdRecoveries == 0) {
       Serial.println("PASS CANDIDATE: recording completed with zero reported drops or short writes.");
       Serial.println("Validate file size, duration, and audio on macOS before declaring PASS.");
     } else {
@@ -636,8 +768,20 @@ void serviceRecording() {
 }
 
 void setup() {
+  const bool cpuFreqApplied = setCpuFrequencyMhz(CPU_FREQUENCY_MHZ);
   Serial.begin(SERIAL_BAUD);
   delay(1200);
+  if (!cpuFreqApplied) {
+    Serial.printf("WARNING: chip rejected %" PRIu32 " MHz; running at %" PRIu32
+                  " MHz instead.\n",
+                  CPU_FREQUENCY_MHZ, static_cast<uint32_t>(getCpuFrequencyMhz()));
+  }
+  if (CPU_POWER_PROFILE < POWER_NORMAL &&
+      (LOGGER_MODE == MODE_RECORD_RAW_PCM || LOGGER_MODE == MODE_RECORD_WAV)) {
+    Serial.println("NOTE: running below 80 MHz. I2S timing is unaffected "
+                   "(PLL-sourced), but confirm dropped/sd-recover stay at "
+                   "zero over a long run before trusting this setting.");
+  }
   printBoardIdentity();
   resetMetrics();
 
