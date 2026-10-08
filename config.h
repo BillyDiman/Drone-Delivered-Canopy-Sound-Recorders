@@ -92,7 +92,7 @@ enum PowerProfile : uint8_t {
   POWER_FULL = 3,
 };
 
-constexpr PowerProfile CPU_POWER_PROFILE = POWER_SUPER_LOW;
+constexpr PowerProfile CPU_POWER_PROFILE = POWER_LOW;
 
 // Only frequencies the chip actually accepts are listed. Both chips run a
 // 40 MHz crystal and support crystal/1 and crystal/2; only the classic

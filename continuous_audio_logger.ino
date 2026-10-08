@@ -120,6 +120,33 @@ void stopWithError(const char *message) {
   Serial.printf("\nFATAL: %s\n", message);
 }
 
+// Must run AFTER the peripherals are initialized, never before.
+//
+// Below 80 MHz the CPU is clocked from the crystal rather than the PLL, and
+// the PLL is powered down on that switch unless a peripheral driver has
+// already claimed it. I2S draws its clock from the 160 MHz PLL, so dropping
+// the CPU clock first leaves I2S with a dead clock: capture then returns
+// nothing and every metrics line reports samples=0. Initializing I2S first
+// registers it as a PLL consumer, which keeps the PLL alive across the
+// switch.
+void applyPowerProfile() {
+  if (getCpuFrequencyMhz() == CPU_FREQUENCY_MHZ) return;
+
+  if (!setCpuFrequencyMhz(CPU_FREQUENCY_MHZ)) {
+    Serial.printf("WARNING: chip rejected %" PRIu32 " MHz; running at %" PRIu32
+                  " MHz instead.\n",
+                  CPU_FREQUENCY_MHZ, static_cast<uint32_t>(getCpuFrequencyMhz()));
+    return;
+  }
+
+  Serial.printf("CPU clock set to %" PRIu32 " MHz (APB %" PRIu32 " Hz)\n",
+                static_cast<uint32_t>(getCpuFrequencyMhz()), getApbFrequency());
+  if (CPU_POWER_PROFILE < POWER_NORMAL) {
+    Serial.println("NOTE: below 80 MHz. Confirm samples/dropped/i2s-short "
+                   "look right over a long run before trusting this.");
+  }
+}
+
 void printBoardIdentity() {
   Serial.println("\nContinuous Audio Logger Prototype");
   Serial.printf("Firmware: %s\n", FIRMWARE_VERSION);
@@ -405,6 +432,7 @@ void fillStressBuffer(uint32_t sequence) {
 
 bool startSdWriteTest() {
   if (!initializeSd()) return false;
+  applyPowerProfile();
   if (!findUnusedPath("SDT", ".BIN", activePath, sizeof(activePath))) return false;
   activeFile = SD.open(activePath, FILE_WRITE);
   if (!activeFile) return false;
@@ -460,6 +488,7 @@ void serviceSdWriteTest() {
 
 bool startI2SDiscardTest() {
   if (!initializeI2S()) return false;
+  applyPowerProfile();
   modeStartUs = esp_timer_get_time();
   return true;
 }
@@ -700,6 +729,7 @@ void writerTask(void *parameter) {
 bool startRecording() {
   if (!initializeSd()) return false;
   if (!initializeI2S()) return false;
+  applyPowerProfile();
 
   freeBlockQueue = xQueueCreate(AUDIO_BLOCK_COUNT, sizeof(AudioBlock *));
   filledBlockQueue = xQueueCreate(AUDIO_BLOCK_COUNT, sizeof(AudioBlock *));
@@ -768,20 +798,8 @@ void serviceRecording() {
 }
 
 void setup() {
-  const bool cpuFreqApplied = setCpuFrequencyMhz(CPU_FREQUENCY_MHZ);
   Serial.begin(SERIAL_BAUD);
   delay(1200);
-  if (!cpuFreqApplied) {
-    Serial.printf("WARNING: chip rejected %" PRIu32 " MHz; running at %" PRIu32
-                  " MHz instead.\n",
-                  CPU_FREQUENCY_MHZ, static_cast<uint32_t>(getCpuFrequencyMhz()));
-  }
-  if (CPU_POWER_PROFILE < POWER_NORMAL &&
-      (LOGGER_MODE == MODE_RECORD_RAW_PCM || LOGGER_MODE == MODE_RECORD_WAV)) {
-    Serial.println("NOTE: running below 80 MHz. I2S timing is unaffected "
-                   "(PLL-sourced), but confirm dropped/sd-recover stay at "
-                   "zero over a long run before trusting this setting.");
-  }
   printBoardIdentity();
   resetMetrics();
 
@@ -789,6 +807,7 @@ void setup() {
   switch (LOGGER_MODE) {
     case MODE_IDLE_BASELINE:
       modeStartUs = esp_timer_get_time();
+      applyPowerProfile();
       started = true;
       Serial.println("Idle baseline running; no SD or I2S peripheral is initialized.");
       break;
