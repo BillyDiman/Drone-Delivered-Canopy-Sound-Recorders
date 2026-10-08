@@ -120,15 +120,12 @@ void stopWithError(const char *message) {
   Serial.printf("\nFATAL: %s\n", message);
 }
 
-// Must run AFTER the peripherals are initialized, never before.
+// Runs after the peripherals are initialized so their clock configuration is
+// already settled when the CPU clock changes.
 //
-// Below 80 MHz the CPU is clocked from the crystal rather than the PLL, and
-// the PLL is powered down on that switch unless a peripheral driver has
-// already claimed it. I2S draws its clock from the 160 MHz PLL, so dropping
-// the CPU clock first leaves I2S with a dead clock: capture then returns
-// nothing and every metrics line reports samples=0. Initializing I2S first
-// registers it as a PLL consumer, which keeps the PLL alive across the
-// switch.
+// Note this ordering is hygiene, not a fix for the sub-80 MHz I2S failure:
+// that was measured to happen either way, which is why config.h refuses to
+// build a microphone mode below POWER_NORMAL.
 void applyPowerProfile() {
   if (getCpuFrequencyMhz() == CPU_FREQUENCY_MHZ) return;
 

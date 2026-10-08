@@ -1,5 +1,11 @@
 # Release notes
 
+## v0.2.1
+
+- Measured on hardware: I2S capture returns no samples at all below 80 MHz. `POWER_FULL` and `POWER_NORMAL` record correctly; `POWER_LOW` and `POWER_SUPER_LOW` silently produce empty recordings (every I2S read times out after 1 s). The failure tracks the CPU clock source changing from PLL to crystal; the mechanism was not identified.
+- `config.h` now fails the build when a microphone mode is combined with a sub-80 MHz profile, rather than letting it fail silently at runtime. The low profiles still build for `MODE_IDLE_BASELINE` and `MODE_SD_WRITE_TEST`.
+- Corrected documentation that previously claimed I2S timing was unaffected by CPU frequency because it is PLL-sourced. The clock source is PLL, but that did not make low profiles safe.
+
 ## v0.2.0
 
 - Storage faults are now recoverable instead of fatal. A short or failed SD write retries, then reopens the file, then remounts the card, and only stops if recovery itself keeps failing. New `sd-retry` and `sd-recover` metrics report it. A retry now resends only the bytes that did not land, rather than duplicating audio already written.

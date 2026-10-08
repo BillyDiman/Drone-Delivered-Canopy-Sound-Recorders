@@ -70,21 +70,26 @@ constexpr int MIC_PIN_DATA = 7; // D5 / SCL
 // has bandwidth to spare. Drop to 4000000 if breadboard wiring is marginal.
 constexpr uint32_t SD_SPI_FREQUENCY_HZ = 10000000;
 
-// CPU clock profile. This workload is I/O-bound (blocked on I2S DMA and SD
-// transfers), not compute-bound, so lower profiles mostly just cost margin.
+// CPU clock profile.
 //
-// What is and is not affected by lowering the CPU clock:
-//   - I2S sample rate is NOT affected. On both chips I2S is clocked from
-//     the 160 MHz PLL, not from the CPU/APB clock, so 48 kHz stays exact.
-//   - SD SPI clock IS affected. SPI is clocked from APB, and APB equals the
-//     CPU frequency once the CPU runs from the crystal (below 80 MHz). This
-//     costs bus bandwidth we do not need, so it is not the real risk.
-//   - The real risk is CPU time. The FAT/SD software stack has to keep up
-//     in real time; at 20-40 MHz that margin shrinks, and at 10 MHz it is
-//     thin. Larger writes (see AUDIO_SAMPLES_PER_BLOCK) help a lot here.
+// MEASURED, not theorized: I2S capture stops working entirely below 80 MHz.
+// POWER_FULL and POWER_NORMAL record correctly; POWER_LOW and
+// POWER_SUPER_LOW produce no samples at all -- every I2S read sits out its
+// full 1 s timeout and returns nothing, so the recording is silently empty.
 //
-// Anything below POWER_NORMAL is worth confirming on real hardware with a
-// long run: check that "dropped" and "sd-recover" stay at zero.
+// The boundary lines up exactly with the CPU clock source: 80 MHz and above
+// run the CPU from the PLL, 40 MHz and below run it from the crystal, and
+// crossing that line kills the capture stream. The precise mechanism was
+// not pinned down; what is certain is the behavior. The static_assert below
+// turns that into a build error rather than an empty SD card.
+//
+// Lower profiles are still useful for the modes that never touch the
+// microphone (MODE_IDLE_BASELINE, MODE_SD_WRITE_TEST), which is exactly
+// what you want for measuring a power floor.
+//
+// Also note the SD SPI clock is derived from APB, and APB follows the CPU
+// clock below 80 MHz, so the requested SPI rate is clamped at runtime.
+// Audio needs only 96 kB/s, so that clamp costs nothing in practice.
 enum PowerProfile : uint8_t {
   POWER_SUPER_LOW = 0,
   POWER_LOW = 1,
@@ -92,7 +97,7 @@ enum PowerProfile : uint8_t {
   POWER_FULL = 3,
 };
 
-constexpr PowerProfile CPU_POWER_PROFILE = POWER_LOW;
+constexpr PowerProfile CPU_POWER_PROFILE = POWER_NORMAL;
 
 // Only frequencies the chip actually accepts are listed. Both chips run a
 // 40 MHz crystal and support crystal/1 and crystal/2; only the classic
@@ -152,6 +157,20 @@ constexpr uint64_t SD_MIN_FREE_BYTES = 32ULL * 1024 * 1024;
 constexpr size_t AUDIO_SAMPLES_PER_BLOCK = 4096;
 constexpr size_t AUDIO_BLOCK_COUNT = 8;
 constexpr size_t SD_STRESS_WRITE_BYTES = 16 * 1024;
+
+constexpr bool LOGGER_MODE_USES_MIC = LOGGER_MODE == MODE_I2S_DISCARD_TEST ||
+                                      LOGGER_MODE == MODE_RECORD_RAW_PCM ||
+                                      LOGGER_MODE == MODE_RECORD_WAV;
+
+// Measured on hardware: below 80 MHz the I2S reads time out and return
+// nothing, so recordings come out empty with no error anywhere. Failing the
+// build is better than discovering that on a card after a deployment.
+static_assert(!(LOGGER_MODE_USES_MIC && CPU_POWER_PROFILE < POWER_NORMAL),
+              "I2S capture returns no samples below 80 MHz. Use POWER_NORMAL "
+              "or POWER_FULL for any mode that reads the microphone. "
+              "POWER_LOW and POWER_SUPER_LOW still work with "
+              "MODE_IDLE_BASELINE and MODE_SD_WRITE_TEST for power floor "
+              "measurements.");
 
 static_assert(STORED_BITS_PER_SAMPLE == 16, "This prototype stores 16-bit PCM");
 static_assert(STORED_CHANNELS == 1, "This prototype stores mono PCM");

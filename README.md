@@ -96,18 +96,20 @@ That's the whole loop. It starts recording the moment it powers up and keeps goi
 
 `CPU_POWER_PROFILE` in `config.h` picks the CPU clock, resolved per board. Only frequencies the chip actually accepts are listed — both boards run a 40 MHz crystal and support crystal/1 and crystal/2, but only the classic ESP32 also supports crystal/4, so the C3 bottoms out at 20 MHz:
 
-| Profile | Classic ESP32 | XIAO ESP32-C3 |
-| --- | --- | --- |
-| `POWER_SUPER_LOW` | 10 MHz | 20 MHz |
-| `POWER_LOW` | 40 MHz | 40 MHz |
-| `POWER_NORMAL` (default) | 80 MHz | 80 MHz |
-| `POWER_FULL` | 240 MHz | 160 MHz |
+| Profile | Classic ESP32 | XIAO ESP32-C3 | Microphone modes |
+| --- | --- | --- | --- |
+| `POWER_SUPER_LOW` | 10 MHz | 20 MHz | Broken — build refused |
+| `POWER_LOW` | 40 MHz | 40 MHz | Broken — build refused |
+| `POWER_NORMAL` (default) | 80 MHz | 80 MHz | Works |
+| `POWER_FULL` | 240 MHz | 160 MHz | Works |
 
-What lowering the CPU clock does and does not affect:
+**`POWER_NORMAL` is the floor for anything that uses the microphone.** This was measured, not predicted: at `POWER_LOW` and `POWER_SUPER_LOW` the I2S reads time out and return nothing, every metrics line reports `samples=0`, and the recording comes out empty with no error raised anywhere. `POWER_FULL` and `POWER_NORMAL` record correctly.
 
-- **I2S sample rate is not affected.** On both chips I2S is clocked from the 160 MHz PLL, not from the CPU/APB clock, so 48 kHz stays exact at any profile.
-- **The SD SPI clock is affected.** SPI is clocked from APB, and APB follows the CPU clock once the CPU drops below 80 MHz (true on *both* chips). The firmware clamps the requested SPI clock to fit and reports it at startup. This costs bandwidth the recording does not need — audio is only 96 kB/s, so even a heavily clamped clock has a large margin.
-- **The real cost is CPU time**, not clocks: the FAT/SD stack still has to keep up in real time. Below `POWER_NORMAL` that margin shrinks. If you use a lower profile, run it for a while and confirm `dropped`, `sd-retry` and `sd-recover` all stay at zero.
+The boundary lines up exactly with the CPU clock source — 80 MHz and up run the CPU from the PLL, 40 MHz and below run it from the crystal, and crossing that line kills capture. The precise mechanism was never pinned down; the behavior is reproducible. `config.h` now **fails the build** if you combine a microphone mode with a sub-80 MHz profile, so this cannot silently produce an empty card again.
+
+The lower profiles still build and run for `MODE_IDLE_BASELINE` and `MODE_SD_WRITE_TEST`, which never touch the microphone — useful for measuring a power floor.
+
+One real effect of lowering the clock: the SD SPI clock is derived from APB, and APB follows the CPU clock below 80 MHz, so the requested SPI rate gets clamped. The firmware does that automatically and reports it at startup. Audio only needs 96 kB/s, so the clamp costs nothing.
 
 Other firmware-side power settings: set `SERIAL_DIAGNOSTICS = false` for a deployed logger (stops the recurring metrics line), and note that larger `AUDIO_SAMPLES_PER_BLOCK` means fewer SD write transactions and less card active time.
 
