@@ -140,14 +140,73 @@ constexpr uint32_t FILE_FLUSH_INTERVAL_MS = 5000;
 // and stopped the whole recording until a power cycle. Instead the writer
 // now retries, then reopens the file, then remounts the card, and only
 // gives up if recovery itself keeps failing.
+// Mounting the card is retried with a progressively slower SPI clock, since
+// a first attempt can fail on marginal wiring or the card's power-up surge.
+constexpr uint8_t SD_MOUNT_RETRY_LIMIT = 4;
+constexpr uint32_t SD_SPI_MIN_FREQUENCY_HZ = 1000000;
+
+// Production behavior. When true, losing the card (pulled out, gone bad, or
+// full) pauses recording instead of ending the run: the board stays awake,
+// discards audio while it has nowhere to put it, and resumes into a new file
+// as soon as a working card is present again. Set false only if you would
+// rather the firmware stop dead on a storage fault.
+constexpr bool PAUSE_WHEN_STORAGE_ABSENT = true;
+constexpr uint32_t STORAGE_RETRY_INTERVAL_MS = 3000;
+
+// Appends one line per notable event to the card, so an unattended run can
+// be explained afterwards without having watched the serial output. This is
+// what tells you whether a short file was a storage fault or a reset, and
+// for a reset, what caused it.
+constexpr bool EVENT_LOG_ENABLED = true;
+constexpr char EVENT_LOG_PATH[] = "/EVENTS.CSV";
+
 constexpr uint8_t SD_WRITE_RETRY_LIMIT = 3;
 constexpr uint8_t SD_RECOVERY_LIMIT = 5;
 constexpr uint32_t SD_RETRY_DELAY_MS = 20;
 constexpr uint32_t SD_RECOVERY_DELAY_MS = 250;
 
-// Stop cleanly instead of thrashing once the card is nearly full. A card
-// that is genuinely out of space cannot be recovered by retrying.
-constexpr uint64_t SD_MIN_FREE_BYTES = 32ULL * 1024 * 1024;
+// Remounting during recovery and while polling for a returned card uses
+// fewer attempts than a cold boot, because recovery already loops around
+// this several times and the full ladder made a removed card take ten
+// seconds to notice.
+constexpr uint8_t SD_REMOUNT_RETRY_LIMIT = 2;
+
+// Recording filenames are REC00001..REC99999, which is still 8.3-safe. At
+// the default 30-minute segment that ceiling is several years of files --
+// far past the point where any card fills up, so it stops being a limit.
+constexpr uint32_t RECORDING_INDEX_MAX = 99999;
+
+// Stop cleanly instead of thrashing once the card is nearly full. The
+// reserve has to be at least one whole segment, otherwise the card fills
+// partway through a file instead of stopping at a clean boundary.
+constexpr uint64_t FILE_SEGMENT_BYTES =
+    static_cast<uint64_t>(FILE_SEGMENT_SECONDS) * STORED_BYTE_RATE;
+constexpr uint64_t SD_MIN_FREE_BYTES =
+    (FILE_SEGMENT_BYTES > 0 ? FILE_SEGMENT_BYTES : 256ULL * 1024 * 1024) +
+    16ULL * 1024 * 1024;
+
+// Safe eject. Pulling a card while a file is open is an unclean unmount and
+// can damage the filesystem over time. Either control closes the file,
+// unmounts, and parks in the paused state so the card can be removed and
+// returned safely.
+//
+// Set EJECT_BUTTON_PIN to a free GPIO to use a button (wired to ground;
+// the internal pull-up is enabled). -1 disables it.
+constexpr int EJECT_BUTTON_PIN = -1;
+constexpr uint32_t EJECT_BUTTON_DEBOUNCE_MS = 50;
+constexpr bool EJECT_VIA_SERIAL = true;  // send 'e' in the Serial Monitor
+
+// A hung task would otherwise leave a silent dead logger in the field until
+// somebody walks out to it. The watchdog reboots instead, costing one file
+// rather than the rest of the deployment. The timeout is deliberately far
+// longer than any legitimate SD stall.
+constexpr bool WATCHDOG_ENABLED = true;
+constexpr uint32_t WATCHDOG_TIMEOUT_MS = 60000;
+
+// Same reasoning for errors that are fatal rather than recoverable (see the
+// README): restarting retries the whole startup instead of sitting dead.
+constexpr bool RESTART_ON_FATAL_ERROR = true;
+constexpr uint32_t FATAL_RESTART_DELAY_MS = 10000;
 
 // Buffers: 4096 mono samples = 8192 stored bytes = about 85.3 ms at 48 kHz.
 // Eight of those is roughly 682 ms of queue reserve. Larger blocks mean

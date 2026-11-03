@@ -1,5 +1,26 @@
 # Release notes
 
+## v0.4.0
+
+- Filenames widened to `REC00001`..`REC99999` (still 8.3-safe), removing the old 9999 ceiling as a practical limit.
+- Filename search replaced with an exponential probe plus bisection: finding a free index on a card holding thousands of files now costs about two dozen lookups instead of thousands, which removes a multi-second stall at boot and on every card reinsertion.
+- The full-card reserve is now derived from the segment size instead of a flat 32 MB, so a card fills up between files rather than partway through one. Free space is sampled once per mount and tracked by subtracting writes, avoiding a slow allocation-table walk on every rotation.
+- A full card no longer remounts and logs every 3 seconds forever; it reports once and waits quietly for a card with space.
+- Remounting during recovery and while polling for a returned card is quieter and uses fewer attempts, cutting both the delay before a removed card is noticed and the resulting log noise. Cold-boot mounting is unchanged.
+- `STORAGE_BACK` now carries the reason for the outage and its duration, recovering information that `STORAGE_LOST` usually could not write because the card was already gone.
+- Added safe ejection via a serial `e` command or an optional button (`EJECT_BUTTON_PIN`), which closes the file and unmounts before the card is pulled.
+- Added a 60-second task watchdog and optional restart-on-fatal-error, so a hung task or an unrecoverable startup failure costs one file instead of the rest of a deployment.
+- Internal timers moved off `millis()` onto a 64-bit microsecond clock, removing the 49.7-day wrap.
+- Metrics now exclude paused time from `expected-bytes` and report `paused=`, so the written-versus-expected comparison stays meaningful after a card swap.
+- Removed the unused `AudioBlock::sequence` field and confined the test-run PASS/FAIL summary to bounded runs, where it is the only place it applies.
+
+## v0.3.0
+
+- Losing the SD card now pauses the run instead of ending it. The board stays awake, discards audio while it has nowhere to write, polls for storage, and resumes into a new file when a working card appears — including a swapped or replaced card. A full card is handled the same way, so swapping in an empty one resumes recording. Previously any of these stopped the logger permanently until a power cycle. Controlled by `PAUSE_WHEN_STORAGE_ABSENT`.
+- Added an on-card event log (`/EVENTS.CSV`) recording boot, file open/close, recovery, storage loss and storage return, so an unattended run can be explained without having watched serial output.
+- `BOOT` entries record the reset reason (`power-on`, `brownout`, `panic`, watchdogs), which distinguishes a short file caused by a board reset from one caused by a storage fault.
+- SD mounting retries up to four times, halving the SPI clock each attempt, instead of giving up after one failure.
+
 ## v0.2.1
 
 - Measured on hardware: I2S capture returns no samples at all below 80 MHz. `POWER_FULL` and `POWER_NORMAL` record correctly; `POWER_LOW` and `POWER_SUPER_LOW` silently produce empty recordings (every I2S read times out after 1 s). The failure tracks the CPU clock source changing from PLL to crystal; the mechanism was not identified.

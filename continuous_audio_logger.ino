@@ -6,6 +6,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <esp_timer.h>
+#include <esp_task_wdt.h>
 
 #include "config.h"
 
@@ -31,7 +32,6 @@ struct Metrics {
 };
 
 struct AudioBlock {
-  uint32_t sequence = 0;
   size_t bytes = 0;
   int16_t pcm[AUDIO_SAMPLES_PER_BLOCK];
 };
@@ -61,7 +61,15 @@ uint64_t lastMetricsMs = 0;
 uint64_t lastFlushMs = 0;
 uint64_t currentSegmentPayloadBytes = 0;
 uint32_t generatedBlockSequence = 0;
+uint64_t totalPausedMs = 0;
 char activePath[32] = {0};
+
+// millis() wraps every 49.7 days, which a long deployment reaches. This is
+// microseconds since boot in a 64-bit counter, so it never wraps in any
+// practical lifetime.
+uint64_t nowMs() {
+  return static_cast<uint64_t>(esp_timer_get_time() / 1000);
+}
 
 void copyMetrics(Metrics &snapshot) {
   portENTER_CRITICAL(&metricsMux);
@@ -188,36 +196,85 @@ uint32_t effectiveSdSpiHz() {
   return SD_SPI_FREQUENCY_HZ > ceiling ? ceiling : SD_SPI_FREQUENCY_HZ;
 }
 
-bool initializeSd() {
+// Free space is sampled once per mount and then tracked by subtracting what
+// we write. Querying the filesystem for free space walks the allocation
+// table, which is far too slow to do on every file rotation.
+uint64_t freeBytesAtMount = 0;
+uint64_t bytesWrittenSinceMount = 0;
+
+uint64_t estimatedFreeBytes() {
+  return bytesWrittenSinceMount >= freeBytesAtMount
+             ? 0
+             : freeBytesAtMount - bytesWrittenSinceMount;
+}
+
+bool initializeSd(uint8_t maxAttempts = SD_MOUNT_RETRY_LIMIT, bool quiet = false) {
   pinMode(SD_PIN_CS, OUTPUT);
   digitalWrite(SD_PIN_CS, HIGH);
   sdSpi.begin(SD_PIN_SCK, SD_PIN_MISO, SD_PIN_MOSI, SD_PIN_CS);
 
-  const uint32_t spiHz = effectiveSdSpiHz();
-  Serial.printf("Initializing SD: SCK=%d MISO=%d MOSI=%d CS=%d at %" PRIu32
-                " Hz (APB %" PRIu32 " Hz)\n",
-                SD_PIN_SCK, SD_PIN_MISO, SD_PIN_MOSI, SD_PIN_CS, spiHz,
-                getApbFrequency());
-  if (spiHz != SD_SPI_FREQUENCY_HZ) {
-    Serial.printf("Note: SD SPI clamped from %" PRIu32 " Hz to fit APB.\n",
-                  SD_SPI_FREQUENCY_HZ);
+  uint32_t spiHz = effectiveSdSpiHz();
+  if (!quiet) {
+    Serial.printf("Initializing SD: SCK=%d MISO=%d MOSI=%d CS=%d at %" PRIu32
+                  " Hz (APB %" PRIu32 " Hz)\n",
+                  SD_PIN_SCK, SD_PIN_MISO, SD_PIN_MOSI, SD_PIN_CS, spiHz,
+                  getApbFrequency());
+    if (spiHz != SD_SPI_FREQUENCY_HZ) {
+      Serial.printf("Note: SD SPI clamped from %" PRIu32 " Hz to fit APB.\n",
+                    SD_SPI_FREQUENCY_HZ);
+    }
   }
 
-  if (!SD.begin(SD_PIN_CS, sdSpi, spiHz)) {
-    Serial.println("SD.begin() failed.");
+  // Mounting is retried, halving the clock each time, because marginal
+  // breadboard wiring and the card's power-up surge make a first attempt
+  // fail intermittently. Giving up on one attempt turns that into a dead
+  // logger that has to be noticed and power-cycled by hand.
+  bool mounted = false;
+  for (uint8_t attempt = 1; attempt <= maxAttempts; ++attempt) {
+    if (SD.begin(SD_PIN_CS, sdSpi, spiHz)) {
+      mounted = true;
+      if (attempt > 1 && !quiet) {
+        Serial.printf("SD mounted on attempt %u at %" PRIu32 " Hz.\n", attempt,
+                      spiHz);
+      }
+      break;
+    }
+    if (!quiet) {
+      Serial.printf("SD.begin() failed at %" PRIu32 " Hz (attempt %u of %u).\n",
+                    spiHz, attempt, maxAttempts);
+    }
+    SD.end();
+    delay(SD_RECOVERY_DELAY_MS);
+    if (spiHz / 2 >= SD_SPI_MIN_FREQUENCY_HZ) spiHz /= 2;
+  }
+
+  if (!mounted) {
+    if (!quiet) {
+      Serial.println("SD would not mount. Check wiring and power, and verify "
+                     "the card still mounts on a computer -- abrupt power loss "
+                     "during a write can corrupt the filesystem.");
+    }
     return false;
   }
 
   const uint8_t type = SD.cardType();
   if (type == CARD_NONE) {
-    Serial.println("No SD card detected.");
+    if (!quiet) Serial.println("No SD card detected.");
+    SD.end();
     return false;
   }
 
-  Serial.printf("SD type: %s\n", cardTypeName(type));
-  Serial.printf("SD capacity: %.2f GB; used: %.2f GB\n",
-                SD.cardSize() / 1000000000.0,
-                SD.usedBytes() / 1000000000.0);
+  const uint64_t total = SD.totalBytes();
+  const uint64_t used = SD.usedBytes();
+  freeBytesAtMount = total > used ? total - used : 0;
+  bytesWrittenSinceMount = 0;
+
+  if (!quiet) {
+    Serial.printf("SD type: %s\n", cardTypeName(type));
+    Serial.printf("SD capacity: %.2f GB; free: %.2f GB (about %.1f hours)\n",
+                  SD.cardSize() / 1000000000.0, freeBytesAtMount / 1000000000.0,
+                  freeBytesAtMount / static_cast<double>(STORED_BYTE_RATE) / 3600.0);
+  }
   return true;
 }
 
@@ -226,10 +283,55 @@ bool initializeSd() {
 // accumulated, and that stall competes with real-time audio writes.
 uint32_t nextPathIndex = 1;
 
+void buildIndexedPath(const char *prefix, uint32_t index, const char *extension,
+                      char *output, size_t outputSize) {
+  snprintf(output, outputSize, "/%s%05" PRIu32 "%s", prefix, index, extension);
+}
+
+bool indexedPathExists(const char *prefix, uint32_t index, const char *extension) {
+  char path[32];
+  buildIndexedPath(prefix, index, extension, path, sizeof(path));
+  return SD.exists(path);
+}
+
+// Finds a free index without walking every file. A card holding a couple of
+// thousand recordings made the old linear scan take seconds, and it ran at
+// boot and on every card reinsertion. This doubles upward to bracket a free
+// slot, then bisects, so a full card costs about two dozen lookups instead
+// of thousands. Gaps from deleted files are fine: any unused index works.
+uint32_t probeFreeIndex(const char *prefix, const char *extension) {
+  if (!indexedPathExists(prefix, 1, extension)) return 1;
+
+  uint32_t lo = 1;
+  uint32_t hi = 2;
+  while (hi <= RECORDING_INDEX_MAX && indexedPathExists(prefix, hi, extension)) {
+    lo = hi;
+    if (hi > RECORDING_INDEX_MAX / 2) {
+      hi = RECORDING_INDEX_MAX + 1;
+      break;
+    }
+    hi *= 2;
+  }
+  if (hi > RECORDING_INDEX_MAX) hi = RECORDING_INDEX_MAX + 1;
+
+  // Invariant: lo is taken, hi is free (or just past the ceiling).
+  while (hi - lo > 1) {
+    const uint32_t mid = lo + (hi - lo) / 2;
+    if (indexedPathExists(prefix, mid, extension)) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return hi;
+}
+
 bool findUnusedPath(const char *prefix, const char *extension,
                     char *output, size_t outputSize) {
-  for (uint32_t index = nextPathIndex; index <= 9999; ++index) {
-    snprintf(output, outputSize, "/%s%04" PRIu32 "%s", prefix, index, extension);
+  if (nextPathIndex <= 1) nextPathIndex = probeFreeIndex(prefix, extension);
+
+  for (uint32_t index = nextPathIndex; index <= RECORDING_INDEX_MAX; ++index) {
+    buildIndexedPath(prefix, index, extension, output, outputSize);
     if (!SD.exists(output)) {
       nextPathIndex = index + 1;
       return true;
@@ -283,7 +385,7 @@ bool openNextRecordingFile() {
   }
 
   currentSegmentPayloadBytes = 0;
-  lastFlushMs = millis();
+  lastFlushMs = nowMs();
 
   if (wav) {
     uint8_t header[44];
@@ -296,6 +398,7 @@ bool openNextRecordingFile() {
   }
 
   Serial.printf("Opened %s\n", activePath);
+  logEvent("OPEN", activePath);
   return true;
 }
 
@@ -324,6 +427,7 @@ bool closeRecordingFile() {
   activeFile.close();
   Serial.printf("Closed %s with %llu payload bytes\n", activePath,
                 static_cast<unsigned long long>(currentSegmentPayloadBytes));
+  logEvent("CLOSE", activePath);
   return true;
 }
 
@@ -382,21 +486,26 @@ size_t writeMeasured(File &file, const uint8_t *data, size_t bytes) {
 
 void printMetrics(bool force = false) {
   if (!SERIAL_DIAGNOSTICS) return;
-  const uint64_t nowMs = millis();
-  if (!force && nowMs - lastMetricsMs < METRICS_INTERVAL_MS) return;
-  lastMetricsMs = nowMs;
+  const uint64_t now = nowMs();
+  if (!force && now - lastMetricsMs < METRICS_INTERVAL_MS) return;
+  lastMetricsMs = now;
 
   Metrics snapshot;
   copyMetrics(snapshot);
   const double seconds = elapsedUs() / 1000000.0;
+  // Time spent paused is excluded, otherwise every pause leaves "written"
+  // permanently behind "expected-bytes" and the comparison stops meaning
+  // anything for the rest of the run.
+  const double pausedSeconds = totalPausedMs / 1000.0;
+  const double recordingSeconds = seconds > pausedSeconds ? seconds - pausedSeconds : 0.0;
   const uint64_t expectedSamples = static_cast<uint64_t>(seconds * SAMPLE_RATE_HZ);
-  const uint64_t expectedStoredBytes = static_cast<uint64_t>(seconds * STORED_BYTE_RATE);
+  const uint64_t expectedStoredBytes = static_cast<uint64_t>(recordingSeconds * STORED_BYTE_RATE);
 
   Serial.printf(
       "t=%.1fs samples=%llu expected=%llu queued=%llu dropped=%llu "
       "written=%llu expected-bytes=%llu max-write=%uus queue-high=%u "
       "raw=[%ld,%ld] zeros=%llu clips=%llu i2s-short=%u sd-short=%u "
-      "sd-retry=%u sd-recover=%u\n",
+      "sd-retry=%u sd-recover=%u paused=%.1fs\n",
       seconds,
       static_cast<unsigned long long>(snapshot.samplesCaptured),
       static_cast<unsigned long long>(expectedSamples),
@@ -413,7 +522,8 @@ void printMetrics(bool force = false) {
       snapshot.i2sShortReads,
       snapshot.sdShortWrites,
       snapshot.sdWriteRetries,
-      snapshot.sdRecoveries);
+      snapshot.sdRecoveries,
+      pausedSeconds);
 }
 
 void fillStressBuffer(uint32_t sequence) {
@@ -435,7 +545,7 @@ bool startSdWriteTest() {
   if (!activeFile) return false;
   Serial.printf("Opened %s\n", activePath);
   modeStartUs = esp_timer_get_time();
-  lastFlushMs = millis();
+  lastFlushMs = nowMs();
   return true;
 }
 
@@ -464,9 +574,9 @@ void serviceSdWriteTest() {
     }
   }
 
-  if (millis() - lastFlushMs >= FILE_FLUSH_INTERVAL_MS) {
+  if (nowMs() - lastFlushMs >= FILE_FLUSH_INTERVAL_MS) {
     activeFile.flush();
-    lastFlushMs = millis();
+    lastFlushMs = nowMs();
   }
 
   printMetrics();
@@ -536,13 +646,14 @@ void serviceI2SDiscardTest() {
 
 void captureTask(void *parameter) {
   (void)parameter;
-  uint32_t sequence = 0;
+  watchdogRegister();
   uint64_t capturedForRun = 0;
   const uint64_t targetSamples = RECORD_TEST_SECONDS == 0
                                      ? UINT64_MAX
                                      : static_cast<uint64_t>(RECORD_TEST_SECONDS) * SAMPLE_RATE_HZ;
 
   while (!fatalError && capturedForRun < targetSamples) {
+    watchdogFeed();
     const uint64_t remainingSamples = targetSamples - capturedForRun;
     const size_t requestedSamples = remainingSamples < AUDIO_SAMPLES_PER_BLOCK
                                         ? static_cast<size_t>(remainingSamples)
@@ -582,7 +693,6 @@ void captureTask(void *parameter) {
       block->pcm[i] = convertMicrophoneSample(transportBuffer[i], wasClipped);
       if (wasClipped) ++clipped;
     }
-    block->sequence = sequence++;
     block->bytes = sampleCount * sizeof(int16_t);
 
     if (xQueueSend(filledBlockQueue, &block, 0) != pdTRUE) {
@@ -606,39 +716,152 @@ void captureTask(void *parameter) {
 }
 
 uint8_t consecutiveRecoveries = 0;
+volatile bool waitingForStorage = false;
+uint64_t lastStorageAttemptMs = 0;
+
+const char *resetReasonName() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  return "power-on";
+    case ESP_RST_EXT:      return "external-pin";
+    case ESP_RST_SW:       return "software";
+    case ESP_RST_PANIC:    return "panic";
+    case ESP_RST_INT_WDT:  return "interrupt-watchdog";
+    case ESP_RST_TASK_WDT: return "task-watchdog";
+    case ESP_RST_WDT:      return "other-watchdog";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO:     return "sdio";
+    default:               return "unknown";
+  }
+}
+
+// Appends a line to the on-card log. Failures are ignored on purpose: the
+// log is a diagnostic aid and must never be able to disturb recording.
+void logEvent(const char *event, const char *detail) {
+  if (!EVENT_LOG_ENABLED) return;
+  File log = SD.open(EVENT_LOG_PATH, FILE_APPEND);
+  if (!log) return;
+  log.printf("%llu,%s,%s\n", static_cast<unsigned long long>(nowMs()), event,
+             detail != nullptr ? detail : "");
+  log.flush();
+  log.close();
+}
+
+// The boot record needs a mounted card, which may not exist until one is
+// inserted some time after startup. Written once, whenever that happens.
+bool bootLogged = false;
+
+void logBootOnce() {
+  if (bootLogged) return;
+  logEvent("BOOT", resetReasonName());
+  bootLogged = true;
+}
 
 bool storageExhausted() {
-  const uint64_t total = SD.totalBytes();
-  const uint64_t used = SD.usedBytes();
-  if (total <= used) return true;
-  return (total - used) < SD_MIN_FREE_BYTES;
+  return estimatedFreeBytes() < SD_MIN_FREE_BYTES;
 }
 
 // Escalating recovery from a failed or short write: reopen the file, then
 // remount the card. A transient card stall used to end the whole recording
 // session permanently; now only a card that stays broken does.
+// Stops writing without ending the run: the board stays awake and keeps
+// checking for usable storage. This is what makes pulling the card a pause
+// rather than the end of the deployment.
+char storageLostReason[32] = {0};
+uint64_t storageLostAtMs = 0;
+bool fullCardReported = false;
+
+void enterStorageWait(const char *reason) {
+  if (!PAUSE_WHEN_STORAGE_ABSENT) {
+    stopWithError(reason);
+    return;
+  }
+
+  // Attempted, but it only lands when the card is still present (a full
+  // card, say). If the card was pulled there is nothing to write to, which
+  // is why the reason is also kept in RAM and recorded on the way back in.
+  logEvent("STORAGE_LOST", reason);
+  snprintf(storageLostReason, sizeof(storageLostReason), "%s", reason);
+  storageLostAtMs = nowMs();
+
+  Serial.printf("Storage unavailable (%s). Recording paused; will resume "
+                "automatically when a working card is present.\n",
+                reason);
+
+  activeFile.close();
+  SD.end();
+  waitingForStorage = true;
+  consecutiveRecoveries = 0;
+  fullCardReported = false;
+  lastStorageAttemptMs = nowMs();
+}
+
+// Polls for storage while paused. A reinserted or swapped card resumes into
+// a fresh file; the filename scan restarts because a different card has
+// different contents.
+bool tryResumeStorage() {
+  if (nowMs() - lastStorageAttemptMs < STORAGE_RETRY_INTERVAL_MS) return false;
+  lastStorageAttemptMs = nowMs();
+
+  // Quiet and shallow: this runs every few seconds for as long as the card
+  // is out, so the full noisy mount ladder would bury the log.
+  if (!initializeSd(SD_REMOUNT_RETRY_LIMIT, true)) return false;
+
+  if (storageExhausted()) {
+    // Said once, not every poll. A full card stays full until somebody
+    // swaps it, and repeating this forever was pure noise.
+    if (!fullCardReported) {
+      Serial.println("Card is full. Waiting for one with free space.");
+      fullCardReported = true;
+    }
+    SD.end();
+    return false;
+  }
+  fullCardReported = false;
+
+  logBootOnce();
+
+  nextPathIndex = 1;
+  if (!openNextRecordingFile()) {
+    SD.end();
+    return false;
+  }
+
+  waitingForStorage = false;
+  totalPausedMs += nowMs() - storageLostAtMs;
+
+  // The matching STORAGE_LOST often could not be written, so this line
+  // carries the reason and the outage length instead.
+  char detail[96];
+  snprintf(detail, sizeof(detail), "%s after %llu ms into %s",
+           storageLostReason[0] != '\0' ? storageLostReason : "unknown",
+           static_cast<unsigned long long>(nowMs() - storageLostAtMs),
+           activePath);
+  Serial.printf("Storage back; recording resumed into %s\n", activePath);
+  logEvent("STORAGE_BACK", detail);
+  return true;
+}
+
 bool recoverStorage() {
   portENTER_CRITICAL(&metricsMux);
   ++metrics.sdRecoveries;
   portEXIT_CRITICAL(&metricsMux);
 
   if (++consecutiveRecoveries > SD_RECOVERY_LIMIT) {
-    stopWithError("SD storage did not recover after repeated attempts");
+    enterStorageWait("recovery exhausted");
     return false;
   }
 
   Serial.printf("SD write trouble; recovery attempt %u of %u\n",
                 consecutiveRecoveries, SD_RECOVERY_LIMIT);
+  logEvent("RECOVER", activePath);
 
   activeFile.close();
   delay(SD_RECOVERY_DELAY_MS);
 
-  // A full card cannot be retried out of, so say so plainly rather than
-  // burning through recovery attempts. Only trust this while the card is
-  // still responding; an unresponsive card reports zero capacity, which
-  // would otherwise look identical to a full one.
+  // Only trust a full-card reading while the card still responds; an
+  // unresponsive card reports zero capacity, identical to a full one.
   if (SD.cardType() != CARD_NONE && storageExhausted()) {
-    stopWithError("SD card is full");
+    enterStorageWait("card full");
     return false;
   }
 
@@ -653,8 +876,50 @@ bool recoverStorage() {
 }
 
 bool rotateSegment() {
-  if (closeRecordingFile() && openNextRecordingFile()) return true;
+  if (!closeRecordingFile()) return recoverStorage();
+
+  // Checked here rather than waiting for a write to fail, so the card runs
+  // out between files instead of partway through one.
+  if (storageExhausted()) {
+    enterStorageWait("card full");
+    return false;
+  }
+
+  if (openNextRecordingFile()) return true;
   return recoverStorage();
+}
+
+// Closes the file and unmounts so the card can be pulled without leaving
+// the filesystem half-written, then parks in the normal paused state.
+void safeEject() {
+  if (waitingForStorage) {
+    Serial.println("Already paused; the card is safe to remove.");
+    return;
+  }
+  Serial.println("Safe eject requested.");
+  closeRecordingFile();
+  enterStorageWait("ejected");
+  Serial.println("Card unmounted. Safe to remove.");
+}
+
+volatile bool ejectRequested = false;
+
+void pollEjectControls() {
+  if (EJECT_VIA_SERIAL && Serial.available() > 0) {
+    const int key = Serial.read();
+    if (key == 'e' || key == 'E') ejectRequested = true;
+  }
+
+  if (EJECT_BUTTON_PIN >= 0) {
+    static uint64_t lastEdgeMs = 0;
+    static int lastLevel = HIGH;
+    const int level = digitalRead(EJECT_BUTTON_PIN);
+    if (level != lastLevel && nowMs() - lastEdgeMs >= EJECT_BUTTON_DEBOUNCE_MS) {
+      lastEdgeMs = nowMs();
+      lastLevel = level;
+      if (level == LOW) ejectRequested = true;
+    }
+  }
 }
 
 bool writeRecordingPayload(const uint8_t *data, size_t bytes) {
@@ -677,6 +942,7 @@ bool writeRecordingPayload(const uint8_t *data, size_t bytes) {
     // tail rather than duplicating audio that already reached the card.
     const size_t written = writeMeasured(activeFile, data + offset, portion);
     currentSegmentPayloadBytes += written;
+    bytesWrittenSinceMount += written;
     offset += written;
 
     if (written != portion) {
@@ -696,18 +962,56 @@ bool writeRecordingPayload(const uint8_t *data, size_t bytes) {
     attempt = 0;
     consecutiveRecoveries = 0;
 
-    if (millis() - lastFlushMs >= FILE_FLUSH_INTERVAL_MS) {
+    if (nowMs() - lastFlushMs >= FILE_FLUSH_INTERVAL_MS) {
       activeFile.flush();
-      lastFlushMs = millis();
+      lastFlushMs = nowMs();
     }
   }
   return offset == bytes;
 }
 
+void watchdogRegister() {
+  if (!WATCHDOG_ENABLED) return;
+  esp_task_wdt_add(nullptr);
+}
+
+void watchdogFeed() {
+  if (!WATCHDOG_ENABLED) return;
+  esp_task_wdt_reset();
+}
+
 void writerTask(void *parameter) {
   (void)parameter;
+  watchdogRegister();
 
   while (!fatalError) {
+    watchdogFeed();
+
+    if (ejectRequested) {
+      ejectRequested = false;
+      safeEject();
+    }
+
+    // Paused: keep draining the queue so capture never blocks, but throw the
+    // audio away because there is nowhere to put it, and keep looking for a
+    // card. Capture stays running so I2S is still healthy when storage
+    // returns.
+    if (waitingForStorage) {
+      AudioBlock *block = nullptr;
+      while (xQueueReceive(filledBlockQueue, &block, 0) == pdTRUE) {
+        portENTER_CRITICAL(&metricsMux);
+        metrics.samplesDropped += block->bytes / sizeof(int16_t);
+        portEXIT_CRITICAL(&metricsMux);
+        xQueueSend(freeBlockQueue, &block, portMAX_DELAY);
+      }
+
+      tryResumeStorage();
+
+      if (captureDone) break;
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
     AudioBlock *block = nullptr;
     if (xQueueReceive(filledBlockQueue, &block, pdMS_TO_TICKS(100)) == pdTRUE) {
       writeRecordingPayload(reinterpret_cast<const uint8_t *>(block->pcm), block->bytes);
@@ -724,7 +1028,13 @@ void writerTask(void *parameter) {
 }
 
 bool startRecording() {
-  if (!initializeSd()) return false;
+  // A missing card at startup is the same condition as losing one mid-run,
+  // so it pauses rather than refusing to start. This also means you can
+  // flash the board with no card in, carry it to where it is going, and
+  // have it begin a clean first file the moment a card goes in.
+  const bool storageReady = initializeSd();
+  if (!storageReady && !PAUSE_WHEN_STORAGE_ABSENT) return false;
+
   if (!initializeI2S()) return false;
   applyPowerProfile();
 
@@ -740,9 +1050,19 @@ bool startRecording() {
     xQueueSend(freeBlockQueue, &block, portMAX_DELAY);
   }
 
-  if (!openNextRecordingFile()) {
-    stopWithError("Could not open the first recording file");
-    return false;
+  Serial.printf("Reset reason: %s\n", resetReasonName());
+
+  if (storageReady) {
+    logBootOnce();
+    if (!openNextRecordingFile()) {
+      stopWithError("Could not open the first recording file");
+      return false;
+    }
+  } else {
+    Serial.println("No usable card at startup. Waiting for one; recording "
+                   "begins as soon as a card is inserted.");
+    waitingForStorage = true;
+    lastStorageAttemptMs = nowMs();
   }
 
   modeStartUs = esp_timer_get_time();
@@ -777,7 +1097,9 @@ bool startRecording() {
 
 void serviceRecording() {
   printMetrics();
-  if (writerDone && !modeFinished) {
+  // Only meaningful for a bounded test run; in production the capture task
+  // never finishes, so none of this executes.
+  if (RECORD_TEST_SECONDS != 0 && writerDone && !modeFinished) {
     AudioI2S.end();
     modeFinished = true;
     printMetrics(true);
@@ -799,6 +1121,19 @@ void setup() {
   delay(1200);
   printBoardIdentity();
   resetMetrics();
+
+  if (WATCHDOG_ENABLED) {
+    esp_task_wdt_config_t wdt = {};
+    wdt.timeout_ms = WATCHDOG_TIMEOUT_MS;
+    wdt.idle_core_mask = 0;
+    wdt.trigger_panic = true;
+    // Already initialized by the core on some builds; reconfigure then.
+    if (esp_task_wdt_init(&wdt) == ESP_ERR_INVALID_STATE) {
+      esp_task_wdt_reconfigure(&wdt);
+    }
+  }
+
+  if (EJECT_BUTTON_PIN >= 0) pinMode(EJECT_BUTTON_PIN, INPUT_PULLUP);
 
   bool started = false;
   switch (LOGGER_MODE) {
@@ -829,9 +1164,18 @@ void setup() {
 void loop() {
   if (fatalError) {
     printMetrics();
+    if (RESTART_ON_FATAL_ERROR) {
+      Serial.printf("Restarting in %" PRIu32 " ms to retry startup.\n",
+                    FATAL_RESTART_DELAY_MS);
+      Serial.flush();
+      delay(FATAL_RESTART_DELAY_MS);
+      ESP.restart();
+    }
     delay(1000);
     return;
   }
+
+  pollEjectControls();
 
   switch (LOGGER_MODE) {
     case MODE_IDLE_BASELINE:
