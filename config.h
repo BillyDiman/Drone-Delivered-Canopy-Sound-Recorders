@@ -12,7 +12,7 @@ enum LoggerMode : uint8_t {
 };
 
 constexpr LoggerMode LOGGER_MODE = MODE_RECORD_RAW_PCM;
-constexpr char FIRMWARE_VERSION[] = "0.2.0";
+constexpr char FIRMWARE_VERSION[] = "0.6.0";
 
 // Serial diagnostics. Set false for a deployed logger: the startup banner
 // still prints, but the periodic metrics line stops, which removes the
@@ -29,9 +29,8 @@ constexpr uint32_t STORED_BYTE_RATE =
     SAMPLE_RATE_HZ * STORED_CHANNELS * (STORED_BITS_PER_SAMPLE / 8);
 
 // SPI microSD and INMP441 wiring. VCC/VDD are physical power connections,
-// not GPIOs. Pin numbers are board-specific, so each supported board gets
-// its own block. Adding a new board means adding a new block here, not
-// changing any other file.
+// not GPIOs. Pin numbers are board-specific, so supporting another board
+// means adding a block here, not changing any other file.
 #if CONFIG_IDF_TARGET_ESP32
 // Classic ESP32 Dev Module / DOIT ESP32 DEVKIT V1.
 constexpr int SD_PIN_SCK = 18;
@@ -43,29 +42,14 @@ constexpr int MIC_PIN_BCLK = 26;
 constexpr int MIC_PIN_WS = 25;
 constexpr int MIC_PIN_DATA = 33;
 
-#elif CONFIG_IDF_TARGET_ESP32C3
-// Seeed XIAO ESP32-C3. D8/D9/D10 are this board's silkscreened SPI pins
-// (SCK/MISO/MOSI); GPIO8 and GPIO9 are boot-strapping pins on this chip,
-// but an idle SD card does not pull them during reset, so this is the
-// documented/standard wiring. CS uses a plain non-strapping pin instead.
-constexpr int SD_PIN_SCK = 8;   // D8
-constexpr int SD_PIN_MISO = 9;  // D9
-constexpr int SD_PIN_MOSI = 10; // D10
-constexpr int SD_PIN_CS = 5;    // D3
-
-constexpr int MIC_PIN_BCLK = 3; // D1
-constexpr int MIC_PIN_WS = 6;   // D4 / SDA
-constexpr int MIC_PIN_DATA = 7; // D5 / SCL
-
 #else
-#error "No pin mapping in config.h for this board yet. Add a block for it " \
-       "(see the CONFIG_IDF_TARGET_ESP32 / CONFIG_IDF_TARGET_ESP32C3 blocks " \
-       "above) instead of guessing pin numbers for an unverified board."
+#error "This firmware targets the classic ESP32 only. Select ESP32 Dev " \
+       "Module or DOIT ESP32 DEVKIT V1, or add a pin block above for the " \
+       "board you are using instead of guessing pin numbers."
 #endif
 
-// Requested SD SPI clock. The SPI peripheral is clocked from APB on both
-// supported chips, and APB follows the CPU clock once the CPU drops below
-// 80 MHz, so this is clamped at runtime to what APB can actually produce.
+// Requested SD SPI clock. The SPI peripheral is clocked from APB, and APB
+// follows the CPU clock once the CPU drops below 80 MHz, so this is clamped at runtime to what APB can actually produce.
 // Audio needs only 96 kB/s (768 kbit/s), so even a heavily clamped clock
 // has bandwidth to spare. Drop to 4000000 if breadboard wiring is marginal.
 constexpr uint32_t SD_SPI_FREQUENCY_HZ = 10000000;
@@ -99,22 +83,14 @@ enum PowerProfile : uint8_t {
 
 constexpr PowerProfile CPU_POWER_PROFILE = POWER_NORMAL;
 
-// Only frequencies the chip actually accepts are listed. Both chips run a
-// 40 MHz crystal and support crystal/1 and crystal/2; only the classic
-// ESP32 additionally supports crystal/4 (10 MHz), so the C3's lowest step
-// is 20 MHz. Requesting an unsupported value makes setCpuFrequencyMhz()
+// Only frequencies the chip actually accepts are listed. The classic ESP32
+// runs a 40 MHz crystal and supports crystal/1, /2 and /4 alongside the
+// PLL-derived steps. Requesting anything else makes setCpuFrequencyMhz()
 // fail and leaves the clock alone, which setup() reports over serial.
-#if CONFIG_IDF_TARGET_ESP32
 constexpr uint32_t CPU_FREQUENCY_MHZ = CPU_POWER_PROFILE == POWER_SUPER_LOW ? 10
                                        : CPU_POWER_PROFILE == POWER_LOW     ? 40
                                        : CPU_POWER_PROFILE == POWER_NORMAL  ? 80
                                                                             : 240;
-#elif CONFIG_IDF_TARGET_ESP32C3
-constexpr uint32_t CPU_FREQUENCY_MHZ = CPU_POWER_PROFILE == POWER_SUPER_LOW ? 20
-                                       : CPU_POWER_PROFILE == POWER_LOW     ? 40
-                                       : CPU_POWER_PROFILE == POWER_NORMAL  ? 80
-                                                                            : 160;
-#endif
 
 // With INMP441 L/R tied to GND, select the left I2S slot.
 // Set false only if L/R is instead tied to 3.3 V.
@@ -151,7 +127,13 @@ constexpr uint32_t SD_SPI_MIN_FREQUENCY_HZ = 1000000;
 // as soon as a working card is present again. Set false only if you would
 // rather the firmware stop dead on a storage fault.
 constexpr bool PAUSE_WHEN_STORAGE_ABSENT = true;
+
+// Polling for a returned card starts brisk so a card swap resumes quickly,
+// then backs off. Each poll mounts and unmounts the card, so retrying every
+// few seconds for days on end would be a lot of pointless card activity.
 constexpr uint32_t STORAGE_RETRY_INTERVAL_MS = 3000;
+constexpr uint32_t STORAGE_RETRY_SLOW_INTERVAL_MS = 15000;
+constexpr uint8_t STORAGE_RETRY_FAST_ATTEMPTS = 20;
 
 // Appends one line per notable event to the card, so an unattended run can
 // be explained afterwards without having watched the serial output. This is

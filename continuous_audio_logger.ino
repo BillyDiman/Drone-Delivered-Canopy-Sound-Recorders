@@ -156,12 +156,17 @@ void printBoardIdentity() {
   Serial.println("\nContinuous Audio Logger Prototype");
   Serial.printf("Firmware: %s\n", FIRMWARE_VERSION);
   Serial.printf("Mode: %s\n", modeName());
-  Serial.printf("Chip: %s, revision %u, cores %u\n",
-                ESP.getChipModel(), ESP.getChipRevision(), ESP.getChipCores());
-  Serial.printf("CPU: %u MHz (APB %" PRIu32 " Hz), flash: %u bytes\n",
-                ESP.getCpuFreqMHz(), getApbFrequency(), ESP.getFlashChipSize());
+  Serial.printf("Chip: %s, revision %u, cores %u\n", ESP.getChipModel(),
+                static_cast<unsigned>(ESP.getChipRevision()),
+                static_cast<unsigned>(ESP.getChipCores()));
+  Serial.printf("CPU: %u MHz (APB %u Hz), flash: %u bytes\n",
+                static_cast<unsigned>(ESP.getCpuFreqMHz()),
+                static_cast<unsigned>(getApbFrequency()),
+                static_cast<unsigned>(ESP.getFlashChipSize()));
   Serial.printf("Stored format: %u Hz, %u-bit, mono (%u bytes/s)\n",
-                SAMPLE_RATE_HZ, STORED_BITS_PER_SAMPLE, STORED_BYTE_RATE);
+                static_cast<unsigned>(SAMPLE_RATE_HZ),
+                static_cast<unsigned>(STORED_BITS_PER_SAMPLE),
+                static_cast<unsigned>(STORED_BYTE_RATE));
   Serial.printf("Buffers: %u blocks x %u samples = %lu ms of reserve\n",
                 static_cast<unsigned>(AUDIO_BLOCK_COUNT),
                 static_cast<unsigned>(AUDIO_SAMPLES_PER_BLOCK),
@@ -505,7 +510,7 @@ void printMetrics(bool force = false) {
       "t=%.1fs samples=%llu expected=%llu queued=%llu dropped=%llu "
       "written=%llu expected-bytes=%llu max-write=%uus queue-high=%u "
       "raw=[%ld,%ld] zeros=%llu clips=%llu i2s-short=%u sd-short=%u "
-      "sd-retry=%u sd-recover=%u paused=%.1fs\n",
+      "sd-retry=%u sd-recover=%u paused=%.1fs heap=%u\n",
       seconds,
       static_cast<unsigned long long>(snapshot.samplesCaptured),
       static_cast<unsigned long long>(expectedSamples),
@@ -513,17 +518,18 @@ void printMetrics(bool force = false) {
       static_cast<unsigned long long>(snapshot.samplesDropped),
       static_cast<unsigned long long>(snapshot.storedBytesWritten),
       static_cast<unsigned long long>(expectedStoredBytes),
-      snapshot.maxSdWriteUs,
-      snapshot.queueHighWater,
+      static_cast<unsigned>(snapshot.maxSdWriteUs),
+      static_cast<unsigned>(snapshot.queueHighWater),
       static_cast<long>(snapshot.rawMinimum == INT32_MAX ? 0 : snapshot.rawMinimum),
       static_cast<long>(snapshot.rawMaximum == INT32_MIN ? 0 : snapshot.rawMaximum),
       static_cast<unsigned long long>(snapshot.zeroSamples),
       static_cast<unsigned long long>(snapshot.clippedSamples),
-      snapshot.i2sShortReads,
-      snapshot.sdShortWrites,
-      snapshot.sdWriteRetries,
-      snapshot.sdRecoveries,
-      pausedSeconds);
+      static_cast<unsigned>(snapshot.i2sShortReads),
+      static_cast<unsigned>(snapshot.sdShortWrites),
+      static_cast<unsigned>(snapshot.sdWriteRetries),
+      static_cast<unsigned>(snapshot.sdRecoveries),
+      pausedSeconds,
+      static_cast<unsigned>(ESP.getFreeHeap()));
 }
 
 void fillStressBuffer(uint32_t sequence) {
@@ -717,6 +723,8 @@ void captureTask(void *parameter) {
 
 uint8_t consecutiveRecoveries = 0;
 volatile bool waitingForStorage = false;
+extern bool awaitingCardRemoval;
+extern uint32_t storageAttempts;
 uint64_t lastStorageAttemptMs = 0;
 
 const char *resetReasonName() {
@@ -792,19 +800,43 @@ void enterStorageWait(const char *reason) {
   waitingForStorage = true;
   consecutiveRecoveries = 0;
   fullCardReported = false;
+  storageAttempts = 0;
   lastStorageAttemptMs = nowMs();
 }
 
 // Polls for storage while paused. A reinserted or swapped card resumes into
 // a fresh file; the filename scan restarts because a different card has
 // different contents.
+uint32_t storageAttempts = 0;
+bool awaitingCardRemoval = false;
+
 bool tryResumeStorage() {
-  if (nowMs() - lastStorageAttemptMs < STORAGE_RETRY_INTERVAL_MS) return false;
+  const uint32_t interval = storageAttempts < STORAGE_RETRY_FAST_ATTEMPTS
+                                ? STORAGE_RETRY_INTERVAL_MS
+                                : STORAGE_RETRY_SLOW_INTERVAL_MS;
+  if (nowMs() - lastStorageAttemptMs < interval) return false;
   lastStorageAttemptMs = nowMs();
+  ++storageAttempts;
 
   // Quiet and shallow: this runs every few seconds for as long as the card
   // is out, so the full noisy mount ladder would bury the log.
-  if (!initializeSd(SD_REMOUNT_RETRY_LIMIT, true)) return false;
+  const bool mounted = initializeSd(SD_REMOUNT_RETRY_LIMIT, true);
+
+  // After a safe eject the card is still sitting in the slot. Remounting it
+  // would resume recording within seconds and defeat the whole point, so
+  // stay parked until the card has actually been taken out, and only then
+  // treat a successful mount as a reinsertion.
+  if (awaitingCardRemoval) {
+    if (mounted) {
+      SD.end();
+      return false;
+    }
+    awaitingCardRemoval = false;
+    Serial.println("Card removed. Waiting for one to be inserted.");
+    return false;
+  }
+
+  if (!mounted) return false;
 
   if (storageExhausted()) {
     // Said once, not every poll. A full card stays full until somebody
@@ -870,7 +902,7 @@ bool recoverStorage() {
   Serial.println("Reopen failed; remounting the card.");
   SD.end();
   delay(SD_RECOVERY_DELAY_MS);
-  if (initializeSd() && openNextRecordingFile()) return true;
+  if (initializeSd(SD_REMOUNT_RETRY_LIMIT) && openNextRecordingFile()) return true;
 
   return false;
 }
@@ -899,7 +931,9 @@ void safeEject() {
   Serial.println("Safe eject requested.");
   closeRecordingFile();
   enterStorageWait("ejected");
-  Serial.println("Card unmounted. Safe to remove.");
+  awaitingCardRemoval = true;
+  Serial.println("Card unmounted. Safe to remove. Recording resumes when a "
+                 "card is inserted again.");
 }
 
 volatile bool ejectRequested = false;
@@ -1069,18 +1103,9 @@ bool startRecording() {
   captureDone = false;
   writerDone = false;
 
-  // On single-core targets (e.g. ESP32-C3) there is no core 1 to pin to;
-  // xTaskCreatePinnedToCore with an out-of-range core ID asserts/fails.
-  // Pin to separate cores only where a second core actually exists, so a
-  // slow SD write can't block I2S capture; otherwise let FreeRTOS
-  // time-slice both tasks on the one core.
-#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+  // Separate cores, so a slow SD write can never delay I2S capture.
   constexpr BaseType_t writerCore = 1;
   constexpr BaseType_t captureCore = 0;
-#else
-  constexpr BaseType_t writerCore = tskNO_AFFINITY;
-  constexpr BaseType_t captureCore = tskNO_AFFINITY;
-#endif
 
   if (xTaskCreatePinnedToCore(writerTask, "sd_writer", 8192, nullptr, 2,
                               &writerTaskHandle, writerCore) != pdPASS) {

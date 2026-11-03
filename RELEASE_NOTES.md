@@ -1,5 +1,20 @@
 # Release notes
 
+## v0.6.0
+
+- Narrowed to the classic ESP32. The Seeed XIAO ESP32-C3 pin block, its CPU frequency table and the single-core task-pinning fallback are gone; building for any other chip family now fails with an explicit message. Capture and writer tasks pin to cores 0 and 1 unconditionally.
+- Removed the fault LED added in v0.5.0, along with its configuration and the capture-stall detection that only fed it.
+- `FIRMWARE_VERSION` corrected — it had been left at `0.2.0` through several releases.
+
+## v0.5.0
+
+- Added a fault LED (`FAULT_LED_PIN`): solid on for a fault, a brief wink every 4 s while healthy, dark when dead. The heartbeat is deliberate — without it an unlit LED means either "fine" or "dead board", which is the one ambiguity this indicator exists to remove. Faults covered: fatal errors, startup failure, not recording, a microphone that has stopped delivering samples, and latched audio loss.
+- **Fixed: safe eject did not work.** After ejecting, the poll remounted the still-inserted card within three seconds and resumed recording, defeating the feature entirely. Ejecting now parks until the card is physically removed, and only then treats a mount as a reinsertion.
+- **Fixed: the recovery path still used the deep mount ladder.** `recoverStorage()` called `initializeSd()` with its default four attempts, so a removed card took twenty mount attempts to give up rather than the ten intended in v0.4.0. Cold-boot mounting is unchanged.
+- Polling for a returned card now backs off from every 3 s to every 15 s after the first minute, cutting pointless mount/unmount cycling during a long outage.
+- Fault logging is handed to the writer task instead of being written from `loop()`, keeping every card access in a single task; the filesystem is reentrant but its mutex would let a log line stall behind an audio write.
+- Free heap is reported in the metrics line, so a slow leak over a multi-week run is visible rather than ending in a crash.
+
 ## v0.4.0
 
 - Filenames widened to `REC00001`..`REC99999` (still 8.3-safe), removing the old 9999 ceiling as a practical limit.
